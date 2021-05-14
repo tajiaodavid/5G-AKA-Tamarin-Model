@@ -1,0 +1,1328 @@
+theory 5G_AKA_v16_0_0
+
+/*
+protcol: 5G_AKA
+Based on: 3GPP TS 33.501 V16.0.0（2019-09）
+*/
+
+begin
+
+builtins:
+	asymmetric-encryption, multiset, xor
+
+functions:
+	// AKA functions (TS 33.102)
+	f1/2, 	 // MAC-function --> MAC
+	f2/2, 	 // MAC-function --> RES
+	f3/2, 	 // KDF 		 --> CK
+	f4/2, 	 // KDF          --> IK
+	f5/2, 	 // KDF          --> AK
+	// KDFs
+	KDFA/2,	 // KDF		 --> KASME*, K_AUSF and K_SEAF
+	FX/2,	 // (KD)F	 --> XRES*
+	SHA256/2 // KDF		 --> HXRES*
+
+
+//安全信道建模
+//使用<Ch_name,Sender,Receiver>来标识信道，分别表示信道名称、发送方和接收方
+//A,B代表协议参与者，m代表发送的消息
+rule send_secure:
+	[SndS(<Ch_name,Sender,Receiver>,A,B,m)]
+	--[SendSecure(Ch_name,A,B,m)]->
+	[Sec(<Ch_name,Sender,Receiver>,A,B,m)]
+	
+rule receive_secure:
+	[Sec(<Ch_name,Sender,Receiver>,A,B,m)]
+	--[ReceiveSecure(Ch_name,A,B,m)]->
+	[RcvS(<Ch_name,Sender,Receiver>,A,B,m)]
+
+		
+//协议实体初始化
+//初始化服务网络SN
+rule init_SN:
+	let 
+		SNID = <'5G', $VPLMNID> //VPLMNID可以简单理解为服务网络SN的标识
+	in
+	[]
+	--[
+		ServNet($VPLMNID),
+		SERV_NET()
+	]->
+	[!SEAF(SNID), Out(SNID)]
+
+//初始化归属网络HN中的ARPF实体
+rule init_ARPF:
+	[Fr(~sk_HN)]
+	--[
+		ARPF_HomeNet($ARPF)
+	]->
+	[!ARPF($ARPF, ~sk_HN),
+	 !Pk($ARPF, pk(~sk_HN)),
+	 Out(<$ARPF, pk(~sk_HN)>)]
+
+//初始化归属网络HN中的AUSF实体，与特定的ARPF相连接，因为AUSF和ARPF都归属于归属网络HN
+rule init_AUSF:
+	[!ARPF($ARPF,~sk_HN)]
+	--[
+		AUSF_HomeNet($AUSF, $ARPF),
+		AUSF_ID($AUSF)
+	]->
+	[!AUSF($AUSF, $ARPF)]
+	
+//初始化UE的订阅过程
+rule init_subscription:
+	[Fr(~SUPI),
+	 Fr(~K),
+	 Fr(~sqn),
+	 !ARPF(ARPF,~sk_HN)]
+	--[
+		Subscribe(~SUPI, ARPF),
+		Sqn_Create(~sqn),	//used for source lemma
+		SUPI_ID(~SUPI),
+		LongTermKey(~SUPI,~K)
+	]->
+	[!LTK_Sym(~SUPI, ARPF, ~K),
+	  SQN_UE(~SUPI, ARPF, ~sqn+'1'),
+	  SQN_ARPF(ARPF, ~SUPI, ~sqn+'1', '1')
+	  //Out(~SUPI) //增加与否，对隐私性质和鉴权性质结果无影响
+	]
+
+
+//建模被敌手危害的UE，导致长期密钥K泄露
+rule reveal_LTK:
+	[!LTK_Sym(SUPI, ARPF, K)]
+	--[ 
+		Rev(<SUPI, ARPF>),
+		RevealKforSUPI(SUPI)
+	]->
+	[Out(K)]
+
+
+/***********协议建模***********/
+//UE发送连接请求给SEAF
+rule ue_send_suci:
+	let
+		SUCI = < aenc{<SUPI, ~R>}pk(~sk_HN), ARPF >
+		msg = SUCI
+	in
+	[!LTK_Sym(SUPI, ARPF, K),
+	 !Pk(ARPF, pk(~sk_HN)),
+	 Fr(~R)]
+	-->
+	[St_1_UE(SUPI, ARPF, K),
+	 Out(msg)]
+
+//SEAF收到UE发来的请求
+rule seaf_receive_suci:
+	[!SEAF(SNID), 
+	 In(SUCI),
+	 Fr(~SEAF_State_ID)]
+	--[
+		StartSeafSession(SNID),
+		SEAF_SUCI(SNID, SUCI),
+		SEAF_ID(SNID),
+		SEAF_State_ID_source(~SEAF_State_ID)
+	]->
+	[St_1_SEAF(~SEAF_State_ID, SNID, SUCI)]
+
+//SEAF发送消息给AUSF（Nausf_UEAuthentication_Authenticate）
+rule seaf_send_ID:
+	let
+		msg = <SUCI, SNID>
+	in
+	[St_1_SEAF(~SEAF_State_ID, SNID, SUCI), 
+	 !AUSF(AUSF, ARPF)]
+	--[
+		Send_AIR_to(AUSF, ARPF)
+	  ]->
+	[St_2_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF),
+	 SndS(<'seaf_ausf','SEAF','AUSF'>,SNID,AUSF,<'air',msg,~SEAF_State_ID>)]	//session binding
+
+//AUSF接收SEAF发来的请求
+rule ausf_receive_ID:
+	let
+		msg = <SUCI, SNID>
+	in
+	[!AUSF(AUSF, ARPF), 
+	 Fr(~AUSF_State_ID), 
+	 RcvS(<'seaf_ausf','SEAF','AUSF'>,SNID,AUSF,<'air',msg, SEAF_State_ID>)]	//session binding
+	--[
+		StartAUSFSession(AUSF),
+		AUSF_State_ID_source(~AUSF_State_ID)
+	]->
+	[St_1_AUSF(~AUSF_State_ID, SNID, SUCI, ARPF, AUSF, SEAF_State_ID)]	//
+
+//AUSF发送请求给ARPF
+rule ausf_send_ID:
+	let
+		msg = <SUCI, SNID>
+	in
+	[St_1_AUSF(~AUSF_State_ID, SNID, SUCI, ARPF, AUSF, SEAF_State_ID)]	//
+	--[
+		AUSF_source(AUSF),
+	    ARPF_source(ARPF),
+	    SUCI_source(SUCI),	//
+	    SEAF_source(SNID),
+	    AUSF_Single_Session(AUSF)
+	]->
+	[St_2_AUSF(~AUSF_State_ID, SNID, SUCI, ARPF, AUSF, SEAF_State_ID),
+	 SndS(<'ausf_arpf','AUSF','ARPF'>,AUSF,ARPF,<'air',msg, ~AUSF_State_ID>)]	//	
+
+//ARPF接收AUSF发来的请求
+rule arpf_receive_ID:
+	let
+		msg = <SUCI, SNID>
+	in
+	[!ARPF(ARPF,~sk_HN), 
+	 !AUSF(AUSF, ARPF),
+	 !LTK_Sym(SUPI, ARPF, K),
+	 SQN_ARPF(ARPF, SUPI, SQN, count),
+	 Fr(~ARPF_State_ID),
+	 In(count),
+	 RcvS(<'ausf_arpf','AUSF','ARPF'>,AUSF,ARPF,<'air',msg, AUSF_State_ID>)]	//
+ 	--[
+		StartARPFSession(ARPF),
+		Sqn_ARPF_Use(SQN, count),
+		ARPF_1()
+	]->
+	[SQN_ARPF(ARPF, SUPI, SQN+'1', count+'1'),
+	 St_1_ARPF(~ARPF_State_ID, ARPF, AUSF, SUCI, SUPI, SNID, K, SQN+'1', ~sk_HN, AUSF_State_ID)]	//
+
+//ARPF生成鉴权向量5G HN AV和SUPI发送给AUSF
+rule arpf_send_HN_AV:
+	let
+		RAND = ~RAND
+		MAC = f1(K, <SQN, RAND, SNID>)	//SNID fix
+		XRES = f2(K, RAND)
+		CK = f3(K, RAND)
+		IK = f4(K, RAND)
+		AK = f5(K, RAND)
+		AUTN = < SQN XOR AK, MAC >
+		K_AUSF = KDFA(<CK, IK>, <SNID, SQN XOR AK>)
+		XRES_star = FX(<CK, IK, XRES, RAND>, SNID)
+		5G_HE_AV = <RAND, AUTN, XRES_star, K_AUSF>
+		msg_OutI = < 5G_HE_AV, SUPI >
+	in
+	[
+	 St_1_ARPF(~ARPF_State_ID, ARPF, AUSF, SUCI, SUPI, SNID, K, SQN, ~sk_HN, AUSF_State_ID),	//
+ 	 Fr(~RAND)
+	]
+	--[	Running(ARPF,<SUPI,SNID,AUSF,ARPF>,KDFA(K_AUSF,SNID),<'ARPF','K_SEAF'>),
+		Running(ARPF,<SUPI,SNID,AUSF,ARPF>,SUPI,<'ARPF','SUPI'>),//
+		Running(ARPF,<SUPI,SNID,AUSF,ARPF>,SNID,<'ARPF','SNID'>),//
+		Src(RAND, AUTN),
+		SrcRand(RAND, SUPI),
+		Secret1(<SUPI,SNID,AUSF,ARPF>,<'ARPF', ARPF>, K_AUSF),
+		Honest(<SUPI, ARPF>),
+		Honest(SNID),
+		ARPF_send(ARPF)
+		, AUSF_State_ID_use(AUSF_State_ID)	//
+ 	]->
+	[SndS(<'ausf_arpf','ARPF','AUSF'>,ARPF,AUSF,<'AIResp',msg_OutI, AUSF_State_ID>)]	//
+	 
+//AUSF接收ARPF发来的5G HN AV和SUPI
+rule ausf_receive_HN_AV:
+	let
+		5G_HE_AV = <RAND, AUTN, XRES_star, K_AUSF>
+		msg_InI = < 5G_HE_AV, SUPI >
+	in
+	[St_2_AUSF(~AUSF_State_ID, SNID, SUCI, ARPF, AUSF, SEAF_State_ID),	//
+	 RcvS(<'ausf_arpf','ARPF','AUSF'>,ARPF,AUSF,<'AIResp',msg_InI, ~AUSF_State_ID>)]	//
+ 	--[	]->
+	[St_3_AUSF(~AUSF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, 5G_HE_AV, SEAF_State_ID)]	//
+
+//AUSF计算HXRES*，发送5G SE AV（不包括K_SEAF）给SEAF
+rule ausf_send_SE_AV:
+	let
+		5G_HE_AV = <RAND, AUTN, XRES_star, K_AUSF>
+		HXRES_star = SHA256(XRES_star, RAND)
+		K_SEAF = KDFA( K_AUSF, SNID )
+		5G_SE_AV = < RAND, AUTN, HXRES_star >
+		aia_msg = < 5G_SE_AV, 'true' >
+	in
+	[St_3_AUSF(~AUSF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, 5G_HE_AV, SEAF_State_ID)]
+ 	--[	
+		Running(AUSF,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'AUSF','K_SEAF'>),
+		Running(AUSF,<SUPI,SNID,AUSF,ARPF>,SUPI,<'AUSF','SUPI'>),//
+		Running(AUSF,<SUPI,SNID,AUSF,ARPF>,SNID,<'AUSF','SNID'>),//
+		Secret1(<SUPI,SNID,AUSF,ARPF>,<'AUSF', AUSF>, K_SEAF),
+		Honest(<SUPI, ARPF>),
+		AUSF_source(AUSF),
+		SEAF_source(SNID),
+		RAND_source(RAND),
+		AUTN_source(AUTN),
+		SUCI_source(SUCI)	//
+		, SEAF_State_ID_use(SEAF_State_ID)	//
+ 	]->
+	[St_4_AUSF(~AUSF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, XRES_star, K_SEAF, RAND),
+	 SndS(<'seaf_ausf','AUSF','SEAF'>,AUSF,SNID,<'aia',aia_msg, SEAF_State_ID>)]
+
+//SEAF接收AUSF发来的5G SE AV
+rule seaf_receive_SE_AV:
+	let
+		5G_SE_AV = < RAND, AUTN, HXRES_star >
+		aia_msg = < 5G_SE_AV, 'true' >
+	in
+	[St_2_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF),
+	 RcvS(<'seaf_ausf','AUSF','SEAF'>,AUSF,SNID,<'aia',aia_msg, ~SEAF_State_ID>)]	//
+ 	--[	//Running(SNID,<SUCI,SNID,AUSF,ARPF>,SUCI,<'SEAF','K_SEAF'>)	//
+	 Running(SNID,<SUCI,SNID,AUSF,ARPF>,SNID,<'SEAF','SNID'>)//
+	]->
+	[St_3_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, HXRES_star, AUTN)]
+
+//SEAF发送AUTN和RAND给UE
+rule seaf_send_authReq:
+	let
+		msg = < RAND, AUTN, SNID >	//
+	in
+	[St_3_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, HXRES_star, AUTN)]
+	--[
+		Out_Src(RAND, AUTN),
+		AuthReq_RAND_source(RAND),
+		AuthReq_AUTN_source(AUTN)
+	]->
+	[St_4_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, HXRES_star), 
+	 Out(msg)]
+
+//UE收到SEAF发来的消息，计算响应RES*并发送给SEAF
+//如果SQN大于SQNMAX，则UE接收SQN
+rule ue_receive_authReq_send:
+	let
+		RES = f2(K, RAND)
+		AK = f5(K, RAND)	//
+		IK = f4(K, RAND)
+		CK = f3(K, RAND)
+		MAC = f1(K, <SQN, RAND, SNID>)	//SNID fix
+		AUTN = < SQN XOR AK, MAC >
+		RES_star = FX(<CK, IK, RES, RAND>, SNID)
+		K_AUSF = KDFA(<CK, IK>, <SNID, SQN XOR AK>)
+		K_SEAF = KDFA( K_AUSF, SNID )
+		msg_In = < RAND, AUTN, SNID >	//
+		msg_Out = RES_star
+	in
+	[St_1_UE(SUPI, ARPF, K), 
+	 SQN_UE(SUPI, ARPF, SQNMAX), 
+	 !AUSF(AUSF, ARPF), 
+	 In(msg_In)
+	 //In(SNID)
+	]
+	--[
+		LessThan(SQNMAX, SQN),
+		Sqn_Ue_Use(SUPI, ARPF, SQN),
+		Running(SUPI,<SUPI,SNID,AUSF,ARPF>,KDFA( K_AUSF, SNID ),<'SUPI','K_SEAF'>),
+		Running(SUPI,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SUPI','SUPI'>),//
+		Running(SUPI,<SUPI,SNID,AUSF,ARPF>,SNID,<'SUPI','SNID'>),//
+		Secret1(<SUPI,SNID,AUSF,ARPF>,<'UE', SUPI>, K_SEAF),
+		Commit(SUPI,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'SUPI','K_SEAF'>),
+		Commit(SUPI,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SUPI','SUPI'>),//
+		Commit(SUPI,<SUPI,SNID,AUSF,ARPF>,SNID,<'SUPI','SNID'>),//
+		UE_END(),
+		Honest(<SUPI, ARPF>),
+		Honest(SNID)
+	]->
+	[St_2_UE(SUPI, ARPF, K, RAND, SNID, AUSF, SQN, K_SEAF), 
+	 SQN_UE(SUPI, ARPF, SQN),
+	 Out(msg_Out)]
+
+//SEAF接收UE发来的RES*，计算HRES*，再发送RES*(不包括SUCI、SNID)给AUSF
+rule seaf_receive_authResp_send_RES:
+	let
+		HXRES_star = SHA256(RES_star, RAND)
+		ac_msg = RES_star
+	in
+	[St_4_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, HXRES_star), 
+	 In(RES_star)]
+	--[ ]->
+	[St_5_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, RES_star),
+	 SndS(<'seaf_ausf','SEAF','AUSF'>,SNID,AUSF,<'ac',ac_msg>)]
+
+//AUSF接收SEAF发来的RES*,验证成功后发送K_SEAF、SUPI给SEAF
+rule ausf_receive_RES_send:
+	let
+		ac_msg = XRES_star
+		aca_msg = <'confirm', K_SEAF, SUPI>
+	in
+	[St_4_AUSF(~AUSF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, XRES_star, K_SEAF, RAND), 
+	 RcvS(<'seaf_ausf','SEAF','AUSF'>,SNID,AUSF,<'ac',ac_msg>)]
+	--[
+		HN_END(),
+		Secret1(<SUPI,SNID,AUSF,ARPF>,<'AUSF', AUSF>, K_SEAF),
+		Commit(AUSF,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'AUSF','K_SEAF'>),
+		Commit(AUSF,<SUPI,SNID,AUSF,ARPF>,SUPI,<'AUSF','SUPI'>),//
+		Commit(AUSF,<SUPI,SNID,AUSF,ARPF>,SNID,<'AUSF','SNID'>),//
+		Honest(<SUPI, ARPF>),
+		Honest(SNID)
+	]->
+	[SndS(<'seaf_ausf','AUSF','SEAF'>,AUSF,SNID,<'aca',aca_msg>)]
+
+//SEAF接收AUSF发来的K_SEAF、SUPI
+rule seaf_receive_K_SEAF:
+	let
+		aca_msg = <'confirm', K_SEAF, SUPI>
+	in
+	[St_5_SEAF(~SEAF_State_ID, SNID, SUCI, ARPF, AUSF, RAND, RES_star), 
+	 RcvS(<'seaf_ausf','AUSF','SEAF'>,AUSF,SNID,<'aca',aca_msg>)]
+	--[
+		SEAF_END(),
+		Running(SNID,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'SEAF','K_SEAF'>),
+		Running(SNID,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SEAF','SUPI'>),//
+		Secret1(<SUPI,SNID,AUSF,ARPF>,<'SEAF', SNID>, K_SEAF),
+		Commit(SNID,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'SEAF','K_SEAF'>),
+		Commit(SNID,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SEAF','SUPI'>),//
+		Honest(<SUPI, ARPF>),
+		Honest(SNID)
+	]->
+	[St_6_SEAF(~SEAF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, RAND, RES_star, K_SEAF),
+	Out(f1(K_SEAF, 'SEAF'))]
+
+//UE和SEAF之间的密钥确认往返
+rule ue_key_confirmation:
+        [St_2_UE(SUPI, ARPF, K, RAND, SNID, AUSF, SQN, K_SEAF), 
+	 	In(f1(K_SEAF, 'SEAF'))]
+        --[
+	    CommitConf(SUPI,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'SUPI','K_SEAF'>),
+		CommitConf(SUPI,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SUPI','SUPI'>),//
+		CommitConf(SUPI,<SUPI,SNID,AUSF,ARPF>,SNID,<'SUPI','SNID'>),//
+		Honest(<SUPI, ARPF>),
+		Honest(SNID)		
+	]->
+	[Out(f1(K_SEAF, 'UE'))]
+
+rule seaf_key_confirmation_check:
+       	[St_6_SEAF(~SEAF_State_ID, SNID, SUCI, SUPI, ARPF, AUSF, RAND, RES_star, K_SEAF),
+	 	In(f1(K_SEAF, 'UE'))]
+        --[
+		CommitConf(SNID,<SUPI,SNID,AUSF,ARPF>,K_SEAF,<'SEAF','K_SEAF'>),
+		CommitConf(SNID,<SUPI,SNID,AUSF,ARPF>,SUPI,<'SEAF','SUPI'>),
+		Honest(<SUPI, ARPF>),
+		Honest(SNID),
+		SEAF_ENDConf() //
+	]->
+	[]
+
+
+/***********协议建模结束***********/
+
+//作用于协议模型的限制条件
+restriction ARPF_HomeNet_once:
+	" All ARPF #i #j. ARPF_HomeNet(ARPF)@i & ARPF_HomeNet(ARPF)@j ==> #i = #j "
+
+restriction AUSF_HomeNet_once_link:
+	" All AUSF ARPF ARPF1 #i #j. AUSF_HomeNet(AUSF, ARPF)@i & AUSF_HomeNet(AUSF, ARPF1)@j ==> #i = #j "
+
+restriction Subscribe_once:
+	" All ARPF ARPF1 SUPI #i #j. Subscribe(SUPI, ARPF)@i & Subscribe(SUPI, ARPF1)@j ==> #i = #j "
+
+restriction ServNet_once:
+	" All VPLMNID #i #j. ServNet(VPLMNID)@i & ServNet(VPLMNID)@j ==> #i = #j "
+
+restriction LessThan:
+	" All x y #i. LessThan(x,y)@#i ==> Ex z. x + z = y "
+
+
+/** Sources lemmas **/
+lemma sqn_src [sources]:
+	" All SQNi count #i. Sqn_ARPF_Use(SQNi, count)@i
+		==> (Ex sqn0 #j. sqn0 + count = SQNi & Sqn_Create(sqn0)@j & j < i) "
+
+/** Helper lemmas **/
+// Terminates quickly under 'S' heuristic (rather than 's').
+lemma sqn_ue_increase[use_induction, reuse]:
+	" All SUPI ARPF SQNi SQNj #i #j.
+		Sqn_Ue_Use(SUPI, ARPF, SQNi)@i & Sqn_Ue_Use(SUPI, ARPF, SQNj)@j & j < i
+			==> (Ex dif. SQNi = SQNj + dif) "
+
+lemma sqn_ue_unique[reuse]:
+	" All SUPI ARPF SQN #i #j.
+		Sqn_Ue_Use(SUPI, ARPF, SQN)@i & Sqn_Ue_Use(SUPI, ARPF, SQN)@j
+			==> #i = #j "
+
+lemma rand_sources_1[sources]:
+"(All RAND #i. RAND_source(RAND) @ #i
+				==> (Ex x #j. Src(RAND, x)@ #j & #j < #i))"
+lemma rand_sources_2[sources]:
+"(All RAND #i. AuthReq_RAND_source(RAND) @ #i
+				==> (Ex x #j. SrcRand(RAND, x)@ #j & #j < #i)
+				| (Ex #j. KU(RAND)@ #j & #j < #i) )"
+lemma autn_sources_1[sources]:
+"(All AUTN #i. AUTN_source(AUTN) @ #i
+				==> (Ex x #j. Src(x, AUTN)@ #j & #j < #i))"
+lemma autn_sources_2[sources]:
+"(All AUTN #i. AuthReq_AUTN_source(AUTN) @ #i
+				==> (Ex x #j. Src(x, AUTN)@ #j & #j < #i)
+				| (Ex #j. KU(AUTN)@ #j & #j < #i) )"
+
+lemma rand_autn_src [sources]:
+" All RAND AUTN #i. Out_Src(RAND, AUTN)@i
+		==> (Ex #j. Src(RAND, AUTN)@j & j < i)
+		| (Ex #j. KU(RAND)@j & j < i)
+		| (Ex #j. KU(AUTN)@j & j < i)
+		| (Ex #j #k . KU(AUTN)@j & j < i
+					& KU(RAND)@k & k < i)"
+
+/** Executability lemmas **/
+lemma trace_exists:
+	exists-trace
+	" Ex #i. HN_END()@i
+		& not (Ex X #r. Rev(X)@r)
+		& (All ARPF1 ARPF2 #j #k. ARPF_HomeNet(ARPF1)@j &
+					  ARPF_HomeNet(ARPF2)@k ==> #j = #k)
+		& (All S1 S2 ARPF1 ARPF2 #j #k. Subscribe(S1, ARPF1)@j &
+						Subscribe(S2, ARPF2)@k ==> #j = #k)
+		& (All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+						  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #j #k. StartAUSFSession(AUSF)@j &
+						  StartAUSFSession(AUSF2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #j #k. AUSF_ID(AUSF)@j &
+						  AUSF_ID(AUSF2)@k ==> #j = #k)
+		& (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+						  StartSeafSession(SNID2)@k ==> #j = #k) 
+		& (All ARPF1 ARPF2 #j #k. StartARPFSession(ARPF1)@j &
+					  StartARPFSession(ARPF2)@k ==> #j = #k)"
+
+/** Secrecy lemmas **/
+//Secrecy of K_SEAF, from the point of view of each component.
+// prove secrecy lemmas in the 's' heuristic
+lemma secrecy_UE:
+	" All a b c d t #i. Secret1(<a,b,c,d>,<'UE', a>, t) @i
+		& not(Ex SUPI ARPF #r. RevealKforSUPI(SUPI)@r & Honest(<SUPI,ARPF>)@i)
+		==> not (Ex #j. K(t)@j)"
+
+lemma secrecy_SEAF:
+	" All a b c d t #i . Secret1(<a,b,c,d>,<'SEAF', b>, t) @i
+		& not(Ex SUPI ARPF #r. RevealKforSUPI(SUPI)@r & Honest(<SUPI,ARPF>)@i)
+		==> not (Ex #j. K(t)@j)"
+
+lemma secrecy_AUSF:
+	" All a b c d t #i . Secret1(<a,b,c,d>,<'AUSF', c>, t) @i
+		& not(Ex SUPI ARPF #r. RevealKforSUPI(SUPI)@r & Honest(<SUPI,ARPF>)@i)
+		==> not (Ex #j. K(t)@j)"
+
+lemma secrecy_ARPF:
+	" All a b c d t #i. Secret1(<a,b,c,d>,<'ARPF', d>, t) @i
+		& not(Ex SUPI ARPF #r. RevealKforSUPI(SUPI)@r & Honest(<SUPI,ARPF>)@i)
+		==> not (Ex #j. K(t)@j)"
+
+// Secrecy of long-term key K
+lemma secrecy_Ki:
+	" All supi ki #i. LongTermKey(supi,ki) @i 
+		& not(Ex #r. RevealKforSUPI(supi)@r)
+		==> not (Ex #j. K(ki)@j)"
+
+
+
+/* Agreement lemmas */
+//从UE的角度，关于SUPI, SNID, K_SEAF的鉴权性质
+/* UE--SEAF--SUPI */
+lemma agreement_UE_SEAF_UE:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SUPI'>) @j
+				)
+	"
+
+lemma agreement_UE_SEAF_UE_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		// & (All AUSF AUSF2 #i #j. AUSF_Single_Session(AUSF)@i & AUSF_Single_Session(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SUPI'>) @j
+				)
+	"
+//
+lemma agreement_UE_SEAF_UE_restricted_Conf:
+	"All a b c d t #i. (CommitConf(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		// & (All AUSF AUSF2 #i #j. AUSF_Single_Session(AUSF)@i & AUSF_Single_Session(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SUPI'>) @j
+				)
+	"
+
+/* UE--SEAF--SNID */
+lemma agreement_UE_SEAF_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SNID'>) @j
+				)
+	"
+//
+lemma agreement_UE_SEAF_SEAF_Conf:
+	"All a b c d t #i. (CommitConf(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SNID'>) @j
+				)
+	"
+
+lemma agreement_UE_SEAF_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SNID'>) @j
+				)
+	"
+
+/* UE--SEAF--K_SEAF */
+lemma agreement_UE_SEAF_K_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_UE_SEAF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	" 
+//
+lemma agreement_UE_SEAF_K_SEAF_Conf:
+	"All a b c d t #i. (CommitConf(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	"
+
+lemma agreement_UE_SEAF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_UE_SEAF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+//
+lemma agreement_UE_SEAF_K_SEAF_injective_Conf:
+	"All a b c d t #i. (CommitConf(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. CommitConf(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+/* UE--AUSF--SUPI */
+lemma agreement_UE_AUSF_UE:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SUPI'>) @j)
+	"
+lemma agreement_UE_AUSF_UE_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SUPI'>) @j
+				)
+	"
+lemma agreement_UE_AUSF_UE_restricted_alternate:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	// &	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  // Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SUPI'>) @j
+				)
+	"
+
+/* UE--AUSF--SNID */
+lemma agreement_UE_AUSF_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SNID'>) @j
+				)
+	"
+lemma agreement_UE_AUSF_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SNID'>) @j
+				)
+	"
+
+
+/* UE--AUSF--K-SEAF */
+lemma agreement_UE_AUSF_K_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_UE_AUSF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_UE_AUSF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_UE_AUSF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+/* UE--ARPF--SUPI */
+lemma agreement_UE_ARPF_UE:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+lemma agreement_UE_ARPF_UE_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+
+/* UE--ARPF--SNID */
+lemma agreement_UE_ARPF_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+lemma agreement_UE_ARPF_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+
+
+/* UE--ARPF--K-SEAF */
+lemma agreement_UE_ARPF_K_SEAF:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_UE_ARPF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_UE_ARPF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_UE_ARPF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(a,<a,b,c,d>,t,<'SUPI','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(a3,<a3,b3,c3,d3>,t,<'SUPI','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+//从SEAF的角度，关于SUPI, SNID, K_SEAF的鉴权性质
+/* SEAF--UE--SUPI */
+lemma agreement_SEAF_UE_UE:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SUPI'>) @j
+				)
+	"
+lemma agreement_SEAF_UE_UE_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		// & (All AUSF AUSF2 #i #j. AUSF_Single_Session(AUSF)@i & AUSF_Single_Session(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SUPI'>) @j
+				)
+	"
+
+/* SEAF--UE--SNID */
+lemma agreement_SEAF_UE_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SNID'>) @j
+				)
+	"
+lemma agreement_SEAF_UE_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SNID'>) @j
+				)
+	"
+
+/* SEAF--UE--K-SEAF */
+lemma agreement_SEAF_UE_K_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+				)
+	"
+lemma agreement_SEAF_UE_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+				)
+	"
+lemma agreement_SEAF_UE_K_SEAF_injective:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_SEAF_UE_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+/* SEAF--AUSF--SUPI */
+lemma agreement_SEAF_AUSF_UE:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SUPI'>) @j
+				)
+	"
+lemma agreement_SEAF_AUSF_UE_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SUPI'>) @j
+				)
+	"
+
+/* SEAF--AUSF--SNID */
+lemma agreement_SEAF_AUSF_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SNID'>) @j
+				)
+	"
+lemma agreement_SEAF_AUSF_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+		// 			StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','SNID'>) @j
+				)
+	"
+
+
+/* SEAF--AUSF--K-SEAF */
+lemma agreement_SEAF_AUSF_K_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_SEAF_AUSF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+				)
+	"
+//prove secrecy lemmas in the 'S' heuristic
+lemma agreement_SEAF_AUSF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_SEAF_AUSF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	// &	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  // Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(c2,<a2,b2,c2,d2>,t,<'AUSF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+/* SEAF--ARPF-SUPI */
+lemma agreement_SEAF_ARPF_UE:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+lemma agreement_SEAF_ARPF_UE_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+
+/* SEAF--ARPF-SNID */
+lemma agreement_SEAF_ARPF_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+lemma agreement_SEAF_ARPF_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+		// 			StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+
+
+/* SEAF--ARPF-K-SEAF */
+lemma agreement_SEAF_ARPF_K_SEAF:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_SEAF_ARPF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_SEAF_ARPF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_SEAF_ARPF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(b,<a,b,c,d>,t,<'SEAF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(b3,<a3,b3,c3,d3>,t,<'SEAF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+//从AUSF的角度，关于SUPI, SNID, K_SEAF的鉴权性质
+/* AUSF--UE--SUPI */
+lemma agreement_AUSF_UE_UE:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SUPI'>) @j
+				)
+	"
+lemma agreement_AUSF_UE_UE_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SUPI'>) @j
+				)
+	"
+
+/* AUSF--UE--SNID */
+lemma agreement_AUSF_UE_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SNID'>) @j
+				)
+	"
+lemma agreement_AUSF_UE_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','SNID'>) @j
+				)
+	"
+
+
+/* AUSF--UE--K-SEAF */
+lemma agreement_AUSF_UE_K_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_UE_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_UE_K_SEAF_injective:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_AUSF_UE_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(a2,<a2,b2,c2,d2>,t,<'SUPI','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+/* AUSF--SEAF--SUPI */
+lemma agreement_AUSF_SEAF_UE:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SUPI'>) @j
+				)
+	"
+lemma agreement_AUSF_SEAF_UE_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SUPI'>) @j
+				)
+	"
+
+/* AUSF--SEAF--SNID */
+lemma agreement_AUSF_SEAF_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SNID'>) @j
+				)
+	"
+lemma agreement_AUSF_SEAF_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','SNID'>) @j
+				)
+	"
+
+
+/* AUSF--SEAF--K-SEAF */
+lemma agreement_AUSF_SEAF_K_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_SEAF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	// &	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  // Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_SEAF_K_SEAF_restricted_alternate:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_SEAF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+lemma agreement_AUSF_SEAF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	// &	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  // Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		&	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					StartSeafSession(SNID2)@k ==> #j = #k)
+		// & (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(b2,<a2,b2,c2,d2>,t,<'SEAF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+			& not (#i3 = #i))
+				)
+	"
+
+/* AUSF--ARPF-SUPI */
+lemma agreement_AUSF_ARPF_UE:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+lemma agreement_AUSF_ARPF_UE_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SUPI'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex b2 c2 d2 a2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SUPI'>) @j
+				)
+	"
+
+/* AUSF--ARPF-SNID */
+lemma agreement_AUSF_ARPF_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+lemma agreement_AUSF_ARPF_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','SNID'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+		// 			StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 c2 d2 b2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','SNID'>) @j
+				)
+	"
+
+
+/* AUSF--ARPF-K-SEAF */
+lemma agreement_AUSF_ARPF_K_SEAF:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_ARPF_K_SEAF_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+				)
+	"
+lemma agreement_AUSF_ARPF_K_SEAF_injective:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i))
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+							& not (#i3 = #i))
+				)
+	"
+lemma agreement_AUSF_ARPF_K_SEAF_injective_restricted:
+	"All a b c d t #i. (Commit(c,<a,b,c,d>,t,<'AUSF','K_SEAF'>) @i
+	& not(Ex #r. RevealKforSUPI(a)@r & Honest(<a,d>)@i)
+	&	(All SQN1 c1 SQN2 c2 #j #k. Sqn_ARPF_Use(SQN1, c1)@j &
+			  Sqn_ARPF_Use(SQN2, c2)@k ==> #j = #k)
+		// &	  (All SNID1 SNID2 #j #k. StartSeafSession(SNID1)@j &
+					// StartSeafSession(SNID2)@k ==> #j = #k)
+		& (All AUSF AUSF2 #i #j. AUSF_ID(AUSF)@i & AUSF_ID(AUSF2)@j ==> #i = #j)
+		)
+			==>(Ex a2 b2 c2 d2 #j . Running(d2,<a2,b2,c2,d2>,t,<'ARPF','K_SEAF'>) @j
+			& not (Ex a3 b3 c3 d3 #i3. Commit(c3,<a3,b3,c3,d3>,t,<'AUSF','K_SEAF'>)@i3
+							& not (#i3 = #i))
+				)
+	"
+
+
+end
